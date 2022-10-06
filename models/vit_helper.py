@@ -22,12 +22,7 @@ from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from timm.models.resnet import resnet26d, resnet50d
 from timm.models.registry import register_model
 import torchvision.models as models
-from .vgg16 import VGG16
-from . import performer_helper
-from . import orthoformer_helper
-from . import nystrom_helper
-from ..visualization.utils import plot_attn_map
-from .transformers import positionalencoding2d
+
 default_cfgs = {
     'vit_1k': 'https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-vitjx/jx_vit_base_p16_224-80ecf9dd.pth',
     'vit_1k_large': 'https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-vitjx/jx_vit_large_p16_224-4ee7a4dc.pth',
@@ -198,81 +193,14 @@ class TrajectoryAttention(nn.Module):
         cls_out = qkv_attn(cls_q * self.scale, k, v)
         cls_out = rearrange(cls_out, f'(b h) f d -> b f (h d)', f=1, h=h)
         
-        if approx == "nystrom":
-            ## Shared spatial landmarks
-            q_, k_, v_ = map(
-                lambda t: rearrange(t, f'b h p d -> (b h) p d', h=h), (q_, k_, v_))
-            x = nystrom_helper.nystrom_spatial_attn(
-                q_, k_, v_,
-                landmarks=num_landmarks,
-                num_frames=F,
-                inv_iters=6,
-                use_spatial_landmarks=True
-            )
-            x = rearrange(x, f'(b h) p f d -> b h p f d', f=F, h=h)
-        elif approx == "orthoformer":
-            x = orthoformer_helper.orthoformer(
-                q_, k_, v_,
-                num_landmarks=num_landmarks,
-                num_frames=F,
-            )
-        elif approx == "performer":
-            # Form random projection matrices:
-            m = 256 # r = 2m, m <= d
-            d = self.head_dim
-            seed = torch.ceil(torch.abs(torch.sum(q_) * performer_helper.BIG_CONSTANT))
-            seed = torch.tensor(seed)
-            projection_matrix = performer_helper.create_projection_matrix(
-                m, d, seed=seed, device=q_.device, dtype=q_.dtype)
-            q_, k_ = map(lambda t: rearrange(t, f'b h p d -> b p h d'), (q_, k_))
-            q_prime = performer_helper.softmax_kernel_transformation(
-                q_, 
-                is_query=True, 
-                projection_matrix=projection_matrix
-            )
-            k_prime = performer_helper.softmax_kernel_transformation(
-                k_, 
-                is_query=False, 
-                projection_matrix=projection_matrix
-            )
-            q_prime, k_prime = map(
-                lambda t: rearrange(t, f'b p h r -> b h p r'), (q_prime, k_prime))
-            k_prime = rearrange(k_prime, 'b h (f n) r -> b h f n r', f=F)
-            v_ = rearrange(v_, 'b h (f n) d -> b h f n d', f=F)
-            kv = torch.einsum('b h f n r, b h f n d -> b h f r d', k_prime, v_)
-            qkv = torch.einsum('b h p r, b h f r d -> b h p f d', q_prime, kv)
-            normaliser = torch.einsum('b h f n r -> b h f r', k_prime)
-            normaliser = torch.einsum('b h p r, b h f r -> b h p f', q_prime, normaliser)
-            x = qkv / normaliser.unsqueeze(-1)
-        else:
-            # Using full attention
-            q_dot_k = q_ @ k_.transpose(-2, -1)
-            q_dot_k = rearrange(q_dot_k, 'b q (f n) -> b q f n', f=F)
-            space_attn = (self.scale * q_dot_k).softmax(dim=-1)
-            attn = self.attn_drop(space_attn)
-            v_ = rearrange(v_, 'b (f n) d -> b f n d', f=F, n=P+O)
-            x = torch.einsum('b q f n, b f n d -> b q f d', attn, v_)
-
-     
-            # t = 4
-            # aaa = rearrange(space_attn ,'(b h) (f q) t n -> b h f q t n', h=h,f =F, t=F, n=196)
-            # aaa = aaa[0].sum(0).view(8,196,8,196)
-            # k = 69 # 91, 101
-            # frame_attn= aaa[4,k,np.arange(8),:]
-            # frame_attn[np.arange(8),frame_attn.argmax(-1)] = 0
-            # plot_attn_map(frame_attn.view(8,14,14),name='obj_traj_'+str(layer_n),n_cols=4,n_rows=2)
-            # import ipdb; ipdb.set_trace()
-            # if layer_n == 5:
-            #     t = 4
-            #     n_ = attn.shape[-1]
-            #     sz = int(n_**0.5)
-            #     aaa = rearrange(space_attn ,'(b h) (f q) t n -> b h f q t n', h=h,f =F, t=F, n=n_)
-            #     aaa = aaa[0].sum(0).view(8,n_,8,n_)
-            #     for ind,k in enumerate([368, 378, 291, 310]):
-            #         frame_attn= aaa[3,k,np.arange(8),:]
-            #         frame_attn[np.arange(8),frame_attn.argmax(-1)] = 0
-            #         plot_attn_map(frame_attn.view(8,sz,sz).detach(),name='obj_traj_'+str(ind),n_cols=4,n_rows=2)
-            #     import ipdb; ipdb.set_trace()
+        # Using full attention
+        q_dot_k = q_ @ k_.transpose(-2, -1)
+        q_dot_k = rearrange(q_dot_k, 'b q (f n) -> b q f n', f=F)
+        space_attn = (self.scale * q_dot_k).softmax(dim=-1)
+        attn = self.attn_drop(space_attn)
+        v_ = rearrange(v_, 'b (f n) d -> b f n d', f=F, n=P+O)
+        x = torch.einsum('b q f n, b f n d -> b q f d', attn, v_)
+    
 
         # Temporal attention: query is the similarity-aggregated patch
         x = rearrange(x, '(b h) s f d -> b s f (h d)', b=B)
@@ -394,12 +322,6 @@ class Block(nn.Module):
                                     spatial_scale=sz)
         roi_output = self.maxpool(roi_output).squeeze(-1)
         out = roi_output.squeeze(-1).view(B,T,O,768)
-        # obj_emb = self.roi_mlp(roi_output.transpose(1,2)) # [B*T*O,1,C]
-        # loc_emb = self.box_mlp(boxes) # [B*T,O,C]
-        # out = rearrange(obj_emb[:,0,:],'(b t o) c -> b t o c', t=T, b=B) + \
-        #     rearrange(loc_emb,'(b t) o c -> b t o c', t=T) + \
-        #     temp_embed.unsqueeze(2).repeat(B,1,O,1) +\
-        #     self.obj_embed.unsqueeze(1).repeat(B,T,1,1)
         return out
 
 
@@ -498,15 +420,7 @@ class PatchEmbedMask(nn.Module):
         trunc_normal_(self.cls_token, std=.02)
         self.pos_embed = nn.Embedding(num_embeddings=self.num_patches + 1,
                                         embedding_dim=768, padding_idx=0)
-        # self.pos_embed = positionalencoding2d(768,img_size[1] // patch_size[1], img_size[0] // patch_size[0])
-        # self.pos_embed =  self.pos_embed.flatten(1,2).t()
-        # import ipdb; ipdb.set_trace()
-        # self.pos_embed = nn.Parameter(
-        #     torch.zeros(1, self.num_patches + 1, embed_dim))
-        # trunc_normal_(self.pos_embed, std=.02)
-        # self.pos_embed = nn.Parameter(
-        #     torch.zeros(1, img_size[0]*img_size[0] + 1, 1))
-    
+
 
     def forward(self, x):
         #[B,T,N,HW] --> [BTN,C,H,W]
@@ -520,9 +434,6 @@ class PatchEmbedMask(nn.Module):
         x = self.proj(x).flatten(2).transpose(1, 2) # [B,hw,C]
         x = torch.cat([self.cls_token.repeat(B*T*N,1,1),x],1)
         x = self.self_attn(self.pre_layer_norm(x)+self.pos_embed.weight[None,:,:])  
-        # x = self.pre_layer_norm(x) +self.pos_embed      
-        # x = torch.cat([self.cls_token.repeat(B*T*N,1,1),x],1)
-        # x = self.self_attn(x)
         return x[:,0,:].view(B,T,N,-1)
     
 class PatchEmbed(nn.Module):
@@ -677,19 +588,6 @@ def load_pretrained(
 
     classifier_name = 'head'
     label_offset = cfg.get('label_offset', 0)
-    # pretrain_classes = 174
-    # if num_classes != pretrain_classes and classifier_name + '.weight' in state_dict:
-    #     # few shot mode, classifier should be initialized again,
-    #     # completely discard fully connected if model num_classes doesn't match pretrained weights
-    # del state_dict[classifier_name + '.weight']
-    # del state_dict[classifier_name + '.bias']
-
-    # if label_offset > 0:
-    #     # special case for pretrained weights with an extra background class in pretrained weights
-    #     classifier_weight = state_dict[classifier_name + '.weight']
-    #     state_dict[classifier_name + '.weight'] = classifier_weight[label_offset:]
-    #     classifier_bias = state_dict[classifier_name + '.bias']
-    #     state_dict[classifier_name + '.bias'] = classifier_bias[label_offset:]
 
     loaded_state = state_dict
     self_state = model.state_dict()
